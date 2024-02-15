@@ -8,6 +8,8 @@ import operator
 import logging
 from typing import Dict
 
+import dask.dataframe as dd
+
 from astropy import units as u
 from astropy.coordinates import Angle
 
@@ -18,6 +20,7 @@ from django.db import transaction
 
 from vast_pipeline.models import Run
 from vast_pipeline.pipeline.utils import add_run_to_img
+from vast_pipeline.daskmanager.manager import DaskManager
 from .association import association, parallel_association
 from .config import PipelineConfig
 from .new_sources import new_sources
@@ -67,6 +70,11 @@ class Pipeline:
         self.config: PipelineConfig = PipelineConfig.from_file(
             config_path, validate=validate_config
         )
+
+        # TODO: Remove this once the pipeline is fully functional
+        # Disable pair_metrics
+        self.config["variability"]["pair_metrics"] = False
+
         self.img_paths: Dict[str, Dict[str, str]] = {
             "selavy": {},
             "noise": {},
@@ -182,6 +190,8 @@ class Pipeline:
             done_images_df = None
             done_source_ids = None
 
+        dm = DaskManager()
+
         # 2.2 Associate with other measurements
         if self.config["source_association"]["parallel"] and n_skyregion_groups > 1:
             images_df = get_parallel_assoc_image_df(images, skyregion_groups)
@@ -198,7 +208,6 @@ class Pipeline:
                 self.add_mode,
                 self.previous_parquets,
                 done_images_df,
-                done_source_ids,
             )
         else:
             images_df = pd.DataFrame.from_dict(
@@ -227,6 +236,12 @@ class Pipeline:
         # n_selavy_measurements = sources_df.
         nr_selavy_measurements = sources_df["id"].unique().shape[0]
 
+        sources_df = dd.from_pandas(
+            sources_df,
+            npartitions=dm.get_nr_workers()
+        ).repartition(partition_size="100MB")
+        sources_df = dm.persist(sources_df)
+
         # STEP #3: Merge sky regions and sources ready for
         # steps 4 and 5 below.
         missing_source_cols = [
@@ -239,7 +254,7 @@ class Pipeline:
             "interim_ns",
             "weight_ns",
         ]
-        # need to make sure no forced measurments are being passed which
+        # need to make sure no forced measurements are being passed which
         # could happen in add mode, otherwise the wrong detection image is
         # assigned.
         missing_sources_df = get_src_skyregion_merged_df(
@@ -247,6 +262,12 @@ class Pipeline:
             images_df,
             skyregs_df,
         )
+
+        missing_sources_df = dd.from_pandas(
+            missing_sources_df,
+            npartitions=dm.get_nr_workers()
+        ).repartition(partition_size="100MB")
+        missing_sources_df = dm.persist(missing_sources_df)
 
         # STEP #4 New source analysis
         new_sources_df = new_sources(
@@ -258,7 +279,7 @@ class Pipeline:
         )
 
         # Drop column no longer required in missing_sources_df.
-        missing_sources_df = missing_sources_df.drop(["in_primary"], axis=1)
+        missing_sources_df = dm.persist(missing_sources_df.drop(["in_primary"], axis=1))
 
         # STEP #5: Run forced extraction/photometry if asked
         if self.config["source_monitoring"]["monitor"]:
@@ -277,7 +298,7 @@ class Pipeline:
                 done_source_ids,
             )
 
-        del missing_sources_df
+            sources_df = dm.persist(sources_df)
 
         # STEP #6: finalise the df getting unique sources, calculating
         # metrics and upload data to database
@@ -308,7 +329,9 @@ class Pipeline:
             p_run.n_new_sources = nr_new_sources
             p_run.save()
 
-        pass
+        del sources_df
+        del missing_sources_df
+        del new_sources_df
 
     @staticmethod
     def check_current_runs() -> None:

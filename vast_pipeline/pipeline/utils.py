@@ -19,12 +19,13 @@ from typing import Any, List, Optional, Dict, Tuple, Union
 from astropy.coordinates import SkyCoord, Angle
 from django.conf import settings
 from django.contrib.auth.models import User
-from psutil import cpu_count
 from itertools import chain
 
 from vast_pipeline.image.main import FitsImage, SelavyImage
 from vast_pipeline.image.utils import open_fits
 from vast_pipeline.utils.utils import (
+    copy_file_or_dir,
+    delete_file_or_dir,
     eq_to_cart,
     StopWatch,
     optimize_ints,
@@ -35,6 +36,17 @@ from vast_pipeline.models import Band, Image, Run, SkyRegion
 
 logger = logging.getLogger(__name__)
 dask.config.set({"multiprocessing.context": "fork"})
+
+
+# Dask custom aggregations
+# from https://docs.dask.org/en/latest/dataframe-groupby.html#aggregate
+collect_list = dd.Aggregation(
+    name='collect_list',
+    chunk=lambda s: s.apply(list),
+    agg=lambda s0: s0.apply(
+        lambda chunks: list(chain.from_iterable(chunks))
+    ),
+)
 
 
 def get_create_skyreg(image: Image) -> SkyRegion:
@@ -513,211 +525,217 @@ def cross_join(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
     return left.assign(key=1).merge(right.assign(key=1), on="key").drop("key", axis=1)
 
 
-def get_eta_metric(
-    row: Dict[str, float], df: pd.DataFrame, peak: bool = False
-) -> float:
-    """
+def get_eta_metric(grp: pd.DataFrame) -> pd.Series:
+    '''
     Calculates the eta variability metric of a source.
     Works on the grouped by dataframe using the fluxes
     of the associated measurements.
+    '''
+    n_meas = grp['id'].count()
+    if n_meas == 1:
+        return pd.Series({'eta_int': 0., 'eta_peak': 0.})
 
-    Args:
-        row: Dictionary containing statistics for the current source.
-        df: The grouped by sources dataframe of the measurements containing all
-            the flux and flux error information,
-        peak: Whether to use peak_flux for the calculation. If False then the
-            integrated flux is used.
-
-    Returns:
-        The calculated eta value.
-    """
-    if row["n_meas"] == 1:
-        return 0.0
-
-    suffix = "peak" if peak else "int"
-    weights = 1.0 / df[f"flux_{suffix}_err"].values ** 2
-    fluxes = df[f"flux_{suffix}"].values
-    eta = (row["n_meas"] / (row["n_meas"] - 1)) * (
-        (weights * fluxes**2).mean()
-        - ((weights * fluxes).mean() ** 2 / weights.mean())
-    )
-    return eta
-
-
-def groupby_funcs(df: pd.DataFrame) -> pd.Series:
-    """
-    Performs calculations on the unique sources to get the
-    lightcurve properties. Works on the grouped by source
-    dataframe.
-
-    Args:
-        df: The current iteration dataframe of the grouped by sources
-            dataframe.
-
-    Returns:
-        Pandas series containing the calculated metrics of the source.
-    """
-    # calculated average ra, dec, fluxes and metrics
     d = {}
-    d["img_list"] = df["image"].values.tolist()
-    d["n_meas_forced"] = df["forced"].sum()
-    d["n_meas"] = df["id"].count()
-    d["n_meas_sel"] = d["n_meas"] - d["n_meas_forced"]
-    d["n_sibl"] = df["has_siblings"].sum()
-    if d["n_meas_forced"] > 0:
-        non_forced_sel = ~df["forced"]
-        d["wavg_ra"] = (
-            df.loc[non_forced_sel, "interim_ew"].sum()
-            / df.loc[non_forced_sel, "weight_ew"].sum()
+    for suffix in ['int', 'peak']:
+        weights = 1. / grp[f'flux_{suffix}_err'].values**2
+        fluxes = grp[f'flux_{suffix}'].values
+        d[f'eta_{suffix}'] = n_meas / (n_meas - 1) * (
+            (weights * fluxes**2).mean() - (
+                (weights * fluxes).mean()**2 / weights.mean()
+            )
         )
-        d["wavg_dec"] = (
-            df.loc[non_forced_sel, "interim_ns"].sum()
-            / df.loc[non_forced_sel, "weight_ns"].sum()
-        )
-        d["avg_compactness"] = df.loc[non_forced_sel, "compactness"].mean()
-        d["min_snr"] = df.loc[non_forced_sel, "snr"].min()
-        d["max_snr"] = df.loc[non_forced_sel, "snr"].max()
+    return pd.Series(d)
 
+
+def aggr_based_on_selection(grp: pd.DataFrame) -> pd.Series:
+    '''
+    Performs aggregation based on the result of a selection
+    '''
+    n_meas_forced = grp['forced'].sum()
+    d = {}
+    if n_meas_forced > 0:
+        non_forced_sel = grp['forced'] != True
+        d['wavg_ra'] = (
+            grp.loc[non_forced_sel, 'interim_ew'].sum() /
+            grp.loc[non_forced_sel, 'weight_ew'].sum()
+        )
+        d['wavg_dec'] = (
+            grp.loc[non_forced_sel, 'interim_ns'].sum() /
+            grp.loc[non_forced_sel, 'weight_ns'].sum()
+        )
+        d['avg_compactness'] = grp.loc[
+            non_forced_sel, 'compactness'
+        ].mean()
+        d['min_snr'] = grp.loc[
+            non_forced_sel, 'snr'
+        ].min()
+        d['max_snr'] = grp.loc[
+            non_forced_sel, 'snr'
+        ].max()
     else:
-        d["wavg_ra"] = df["interim_ew"].sum() / df["weight_ew"].sum()
-        d["wavg_dec"] = df["interim_ns"].sum() / df["weight_ns"].sum()
-        d["avg_compactness"] = df["compactness"].mean()
-        d["min_snr"] = df["snr"].min()
-        d["max_snr"] = df["snr"].max()
-
-    d["wavg_uncertainty_ew"] = 1.0 / np.sqrt(df["weight_ew"].sum())
-    d["wavg_uncertainty_ns"] = 1.0 / np.sqrt(df["weight_ns"].sum())
-    for col in ["avg_flux_int", "avg_flux_peak"]:
-        d[col] = df[col.split("_", 1)[1]].mean()
-    for col in ["max_flux_peak", "max_flux_int"]:
-        d[col] = df[col.split("_", 1)[1]].max()
-    for col in ["min_flux_peak", "min_flux_int"]:
-        d[col] = df[col.split("_", 1)[1]].min()
-    for col in ["min_flux_peak_isl_ratio", "min_flux_int_isl_ratio"]:
-        d[col] = df[col.split("_", 1)[1]].min()
-
-    for col in ["flux_int", "flux_peak"]:
-        d[f"{col}_sq"] = (df[col] ** 2).mean()
-    d["v_int"] = df["flux_int"].std() / df["flux_int"].mean()
-    d["v_peak"] = df["flux_peak"].std() / df["flux_peak"].mean()
-    d["eta_int"] = get_eta_metric(d, df)
-    d["eta_peak"] = get_eta_metric(d, df, peak=True)
-    # remove not used cols
-    for col in ["flux_int_sq", "flux_peak_sq"]:
-        d.pop(col)
-
-    # get unique related sources
-    list_uniq_related = list(
-        set(chain.from_iterable(lst for lst in df["related"] if isinstance(lst, list)))
-    )
-    d["related_list"] = list_uniq_related if list_uniq_related else -1
-
-    return pd.Series(d).fillna(value={"v_int": 0.0, "v_peak": 0.0})
+        d['wavg_ra'] = grp['interim_ew'].sum() / grp['weight_ew'].sum()
+        d['wavg_dec'] = grp['interim_ns'].sum() / grp['weight_ns'].sum()
+        d['avg_compactness'] = grp['compactness'].mean()
+        d['min_snr'] = grp['snr'].min()
+        d['max_snr'] = grp['snr'].max()
+    return pd.Series(d)
 
 
-def parallel_groupby(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Performs the parallel source dataframe operations to calculate the source
-    metrics using Dask and returns the resulting dataframe.
+def groupby_collect_set(grp: pd.DataFrame) -> list[str]:
+    """Collect the unique set of lists from the column.
 
     Args:
-        df: The sources dataframe produced by the previous pipeline stages.
+        df: The dataframe to collect the lists from.
 
     Returns:
-        The source dataframe with the calculated metric columns.
-    """
-    col_dtype = {
-        "img_list": "O",
-        "n_meas_forced": "i",
-        "n_meas": "i",
-        "n_meas_sel": "i",
-        "n_sibl": "i",
-        "wavg_ra": "f",
-        "wavg_dec": "f",
-        "avg_compactness": "f",
-        "min_snr": "f",
-        "max_snr": "f",
-        "wavg_uncertainty_ew": "f",
-        "wavg_uncertainty_ns": "f",
-        "avg_flux_int": "f",
-        "avg_flux_peak": "f",
-        "max_flux_peak": "f",
-        "max_flux_int": "f",
-        "min_flux_peak": "f",
-        "min_flux_int": "f",
-        "min_flux_peak_isl_ratio": "f",
-        "min_flux_int_isl_ratio": "f",
-        "v_int": "f",
-        "v_peak": "f",
-        "eta_int": "f",
-        "eta_peak": "f",
-        "related_list": "O",
-    }
-    n_cpu = cpu_count() - 1
-    out = dd.from_pandas(df, n_cpu)
-    out = (
-        out.groupby("source")
-        .apply(groupby_funcs, meta=col_dtype)
-        .compute(num_workers=n_cpu, scheduler="processes")
-    )
-
-    out["n_rel"] = out["related_list"].apply(lambda x: 0 if x == -1 else len(x))
-
-    return out
-
-
-def calc_ave_coord(grp: pd.DataFrame) -> pd.Series:
-    """
-    Calculates the average coordinate of the grouped by sources dataframe for
-    each unique group, along with defining the image and epoch list for each
-    unique source (group).
-
-    Args:
-        grp: The current group dataframe (unique source) of the grouped by
-            dataframe being acted upon.
-
-    Returns:
-        A pandas series containing the average coordinate along with the
-            image and epoch lists.
+        The unique set of lists.
     """
     d = {}
-    grp = grp.sort_values(by="datetime")
-    d["img_list"] = grp["image"].values.tolist()
-    d["epoch_list"] = grp["epoch"].values.tolist()
-    d["wavg_ra"] = grp["interim_ew"].sum() / grp["weight_ew"].sum()
-    d["wavg_dec"] = grp["interim_ns"].sum() / grp["weight_ns"].sum()
+
+    lists = [list(i) if isinstance(i, np.ndarray) else ["NULL",] for i in grp['related']]
+
+    the_list = list(set(chain.from_iterable(lists)))
+
+    # Remove 'NULL' from the list if the length is > 1
+    if len(the_list) > 1 and 'NULL' in the_list:
+        the_list.remove('NULL')
+
+    d['related_list'] = the_list
 
     return pd.Series(d)
 
 
-def parallel_groupby_coord(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    This function uses Dask to perform the average coordinate and unique image
-    and epoch lists calculation. The result from the Dask compute is returned
-    which is a dataframe containing the results for each source.
+def parallel_groupby(df: dd.DataFrame) -> dd.DataFrame:
+    '''
+    Performs calculations on the unique sources to get the
+    lightcurve properties. Works on the grouped by source
+    dataframe.
+    '''
+    # create list of output columns and dicts with aggregations and rename maps
+    # CANNOT get this to work and I don't know why
+    # collect_set = dd.Aggregation(
+    #     name='collect_set',
+    #     chunk=lambda s: s.apply(lambda x: list(x) if isinstance(x, np.ndarray) else []),
+    #     agg=lambda s0: s0.apply(
+    #         lambda chunks: list(set(chain.from_iterable(chunks)))
+    #     )
+    # )
 
-    Args:
-        df: The sources dataframe produced by the pipeline.
-
-    Returns:
-        The resulting average coordinate values and unique image and epoch
-            lists for each unique source (group).
-    """
-    col_dtype = {
-        "img_list": "O",
-        "epoch_list": "O",
-        "wavg_ra": "f",
-        "wavg_dec": "f",
+    aggregations = {
+        'image': collect_list,
+        'forced': 'sum',
+        'id': 'count',
+        'has_siblings': 'sum',
+        'weight_ew': 'sum',
+        'weight_ns': 'sum',
+        'flux_int': ['mean', 'std', 'max', 'min'],
+        'flux_peak': ['mean', 'std', 'max', 'min'],
+        'flux_peak_isl_ratio': 'min',
+        'flux_int_isl_ratio': 'min',
     }
-    n_cpu = cpu_count() - 1
-    out = dd.from_pandas(df, n_cpu)
+
+    renaming = {
+        'image_collect_list': 'img_list',
+        'forced_sum': 'n_meas_forced',
+        'id_count': 'n_meas',
+        'has_siblings_sum': 'n_sibl',
+        'flux_int_mean': 'avg_flux_int',
+        'flux_peak_mean': 'avg_flux_peak',
+        'flux_peak_max': 'max_flux_peak',
+        'flux_peak_min': 'min_flux_peak',
+        'flux_int_max': 'max_flux_int',
+        'flux_int_min': 'min_flux_int',
+        'flux_peak_isl_ratio_min': 'min_flux_peak_isl_ratio',
+        'flux_int_isl_ratio_min': 'min_flux_int_isl_ratio',
+    }
+
+    groupby = df.groupby('source')
+    out = groupby.agg(aggregations)
+    # collapse columns Multindex
+    out.columns = ['_'.join(col) for col in out.columns.to_flat_index()]
+    # do some other column calcs
+    out['wavg_uncertainty_ew'] = 1. / np.sqrt(out['weight_ew_sum'])
+    out['wavg_uncertainty_ns'] = 1. / np.sqrt(out['weight_ns_sum'])
+    out['v_int'] = out['flux_int_std'] / out['flux_int_mean']
+    out['v_peak'] = out['flux_peak_std'] / out['flux_peak_mean']
+    out['v_int'] = out['v_int'].fillna(0.0)
+    out['v_peak'] = out['v_peak'].fillna(0.0)
+
+    # do complex aggregations using groupby-apply
+    col_dtype = {
+        'wavg_ra': 'f',
+        'wavg_dec': 'f',
+        'avg_compactness': 'f',
+        'min_snr': 'f',
+        'max_snr': 'f'
+    }
     out = (
-        out.groupby("source")
-        .apply(calc_ave_coord, meta=col_dtype)
-        .compute(num_workers=n_cpu, scheduler="processes")
+        out.merge(
+            groupby.apply(aggr_based_on_selection, meta=col_dtype),
+            left_index=True,
+            right_index=True
+        ).repartition(npartitions=1)
+        .merge(
+            groupby.apply(
+                get_eta_metric,
+                meta={'eta_int': 'f', 'eta_peak': 'f'}
+            ),
+            left_index=True,
+            right_index=True
+        ).repartition(npartitions=1)
+        .merge(
+            groupby.apply(groupby_collect_set, meta={'related_list': 'O'}),
+            left_index=True,
+            right_index=True
+        ).repartition(npartitions=1)
     )
 
-    return out
+    out = out.rename(columns=renaming)
+    out['n_meas_sel'] = out['n_meas'] - out['n_meas_forced']
+    out['n_rel'] = out['related_list'].apply(len, meta=('related_list', 'int64'))
+
+    # select only columns we need
+    out_cols = [
+        'img_list', 'n_meas_forced', 'n_meas', 'n_meas_sel', 'n_sibl',
+        'wavg_ra', 'wavg_dec', 'avg_compactness', 'min_snr', 'max_snr',
+        'wavg_uncertainty_ew', 'wavg_uncertainty_ns', 'avg_flux_int',
+        'max_flux_int', 'min_flux_int',  'avg_flux_peak', 'max_flux_peak',
+        'min_flux_peak', 'min_flux_peak_isl_ratio', 'min_flux_int_isl_ratio',
+        'v_int', 'v_peak', 'eta_int', 'eta_peak', 'related_list', 'n_rel'
+    ]
+    out = out[out_cols]
+
+    return out.persist()
+
+
+def parallel_groupby_coord(df: dd.core.DataFrame) -> pd.DataFrame:
+    """Calculate the weighted average RA and Dec of the sources.
+
+    Note that Sergio had the idea to persist the dataframe result and keep it in the
+    cluster. However since then the ideal image method uses the astropy match sky
+    method which relies on being able to iloc the dataframe. This would be really
+    difficult to do with a persisted dataframe. So it is computed.
+
+    Args:
+        df: The persisted sources dataframe.
+
+    Returns:
+        The average coordinates of the sources along with image and epoch lists.
+    """
+    cols = [
+        'source', 'image', 'epoch', 'interim_ew', 'weight_ew', 'interim_ns', 'weight_ns'
+    ]
+    cols_to_sum = ['interim_ew', 'weight_ew', 'interim_ns', 'weight_ns']
+
+    groups = df[cols].groupby('source')
+    out = groups[cols_to_sum].agg('sum')
+    out['wavg_ra'] = out['interim_ew'] / out['weight_ew']
+    out['wavg_dec'] = out['interim_ns'] / out['weight_ns']
+    out = out.drop(cols_to_sum, axis=1)
+    out['img_list'] = groups['image'].agg(collect_list)
+    out['epoch_list'] = groups['epoch'].agg(collect_list)
+
+    return out.compute()
 
 
 def get_rms_noise_image_values(rms_path: str) -> Tuple[float, float, float]:
@@ -768,7 +786,9 @@ def get_image_list_diff(row: pd.Series) -> Union[List[str], int]:
         A list of the images missing from the observed image list.
         A '-1' integer value if there are no missing images.
     """
-    out = list(filter(lambda arg: arg not in row["img_list"], row["skyreg_img_list"]))
+    out = list(filter(
+        lambda arg: arg not in row["img_list"], row["skyreg_img_list"]
+    ))
 
     # set empty list to -1
     if not out:
@@ -842,8 +862,8 @@ def check_primary_image(row: pd.Series) -> bool:
 
 
 def get_src_skyregion_merged_df(
-    sources_df: pd.DataFrame, images_df: pd.DataFrame, skyreg_df: pd.DataFrame
-) -> pd.DataFrame:
+    sources_df: dd.core.DataFrame, images_df: pd.DataFrame, skyreg_df: pd.DataFrame
+) -> dd.core.DataFrame:
     """
     Analyses the current sources_df to determine what the 'ideal coverage'
     for each source should be. In other words, what images is the source
@@ -915,14 +935,12 @@ def get_src_skyregion_merged_df(
         on="id",
     )
 
-    sources_df = sources_df.sort_values(by="datetime")
     # calculate some metrics on sources
     # compute only some necessary metrics in the groupby
     timer = StopWatch()
+    # Drop forced measurements as they are not used in the ideal coverage
     srcs_df = parallel_groupby_coord(sources_df)
     logger.debug("Groupby-apply time: %.2f seconds", timer.reset())
-
-    del sources_df
 
     # crossmatch sources with sky regions up to the max sky region radius
     skyreg_coords = SkyCoord(
@@ -1295,10 +1313,11 @@ def backup_parquets(p_run_path: str) -> None:
 
     for i in parquets:
         backup_name = i + ".bak"
-        if os.path.isfile(backup_name):
+        if os.path.isfile(backup_name) or os.path.isdir(backup_name):
             logger.debug(f"Removing old backup file: {backup_name}.")
-            os.remove(backup_name)
-        shutil.copyfile(i, backup_name)
+            delete_file_or_dir(backup_name)
+
+        copy_file_or_dir(i, backup_name)
 
 
 def create_temp_config_file(p_run_path: str) -> None:
@@ -1361,8 +1380,10 @@ def reconstruct_associtaion_dfs(
         forced_parquet = os.path.join(
             run_path, "forced_measurements_{}.parquet".format(i.replace(".", "_"))
         )
-        if os.path.isfile(forced_parquet):
+        if os.path.isfile(forced_parquet) or os.path.isdir(forced_parquet):
             img_fmeas_paths.append(forced_parquet)
+
+    logger.debug("Found %i forced measurement parquet files.", len(img_fmeas_paths))
 
     # Create union of paths.
     img_meas_paths += img_fmeas_paths
@@ -1425,7 +1446,7 @@ def reconstruct_associtaion_dfs(
             "uncertainty_ew": "uncertainty_ew_source",
             "uncertainty_ns": "uncertainty_ns_source",
         }
-    )
+    ).reset_index(drop=True)
 
     # Load up the previous unique sources.
     prev_sources = pd.read_parquet(
@@ -1450,7 +1471,7 @@ def reconstruct_associtaion_dfs(
             "wavg_uncertainty_ew": "uncertainty_ew",
             "wavg_uncertainty_ns": "uncertainty_ns",
         }
-    )
+    ).reset_index(drop=True)
 
     # Load the previous relations
     prev_relations = pd.read_parquet(previous_parquet_paths["relations"])
@@ -1465,13 +1486,15 @@ def reconstruct_associtaion_dfs(
     # Append the relations to only the last instance of each source
     # First get the ids of the sources
     relation_ids = (
-        sources_df[sources_df.source.isin(prev_relations.index.values)]
+        sources_df[sources_df["source"].isin(prev_relations.index.values)]
         .drop_duplicates("source", keep="last")
         .index.values
     )
+
     # Make sure we attach the correct source id
-    source_ids = sources_df.loc[relation_ids].source.values
-    sources_df["related"] = np.nan
+    source_ids = sources_df.loc[relation_ids]["source"].values
+    sources_df["related"] = "NULL"
+    sources_df["related"] = sources_df["related"].apply(lambda x: [x,])
     relations_to_update = prev_relations.loc[source_ids].to_numpy().copy()
     relations_to_update = np.reshape(relations_to_update, relations_to_update.shape[0])
     sources_df.loc[relation_ids, "related"] = relations_to_update
@@ -1513,7 +1536,7 @@ def reconstruct_associtaion_dfs(
     # Create the unique skyc1_srcs dataframe.
     skyc1_srcs = (
         sources_df[~sources_df["forced"]]
-        .sort_values(by="id")
+        .sort_values(by=["epoch", "id"])
         .drop("related", axis=1)
         .drop_duplicates("source")
     ).copy(deep=True)

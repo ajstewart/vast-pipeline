@@ -2,6 +2,8 @@ import os
 import logging
 import numpy as np
 import pandas as pd
+import dask.array as da
+import dask.dataframe as dd
 
 from astropy import units as u
 from astropy.coordinates import SkyCoord
@@ -91,7 +93,7 @@ def calculate_measurement_pair_aggregate_metrics(
 
 
 def final_operations(
-    sources_df: pd.DataFrame,
+    sources_df: dd.DataFrame,
     p_run: Run,
     new_sources_df: pd.DataFrame,
     calculate_pairs: bool,
@@ -140,34 +142,43 @@ def final_operations(
     timer = StopWatch()
 
     # calculate source fields
-    logger.info(
-        "Calculating statistics for %i sources...", sources_df.source.unique().shape[0]
-    )
+    logger.info("Calculating statistics for sources...")
     srcs_df = parallel_groupby(sources_df)
-    logger.info("Groupby-apply time: %.2f seconds", timer.reset())
+    srcs_df = srcs_df.fillna(0.)
 
     # add new sources
-    srcs_df["new"] = srcs_df.index.isin(new_sources_df.index)
-    srcs_df = pd.merge(
-        srcs_df,
-        new_sources_df["new_high_sigma"],
-        left_on="source",
-        right_index=True,
-        how="left",
+    srcs_df['new'] = srcs_df.index.isin(
+        new_sources_df.index.values.compute()
     )
+
+    # add new high sigma
+    srcs_df = srcs_df.merge(
+        new_sources_df[['new_high_sigma']],
+        left_index=True, right_index=True, how='left'
+    )
+
     srcs_df["new_high_sigma"] = srcs_df["new_high_sigma"].fillna(0.0)
 
     # calculate nearest neighbour
-    srcs_skycoord = SkyCoord(
-        srcs_df["wavg_ra"].values, srcs_df["wavg_dec"].values, unit=(u.deg, u.deg)
-    )
+    ra, dec = dd.compute(srcs_df['wavg_ra'], srcs_df['wavg_dec'])
+    srcs_skycoord = SkyCoord(ra, dec, unit=(u.deg, u.deg))
+    del ra, dec
+
     _, d2d, _ = srcs_skycoord.match_to_catalog_sky(srcs_skycoord, nthneighbor=2)
 
     # add the separation distance in degrees
-    srcs_df["n_neighbour_dist"] = d2d.deg
+    arr_chunks = tuple(srcs_df.map_partitions(len).compute())
+    srcs_df['n_neighbour_dist'] = da.from_array(d2d.deg, chunks=arr_chunks)
+    del arr_chunks, d2d, srcs_skycoord
+    # srcs_df["n_neighbour_dist"] = d2d.deg
+
+    # should be safe to compute at this point
+    srcs_df = srcs_df.compute()
 
     # create measurement pairs, aka 2-epoch metrics
+    calculate_pairs = False
     if calculate_pairs:
+        # WARNING: This is currently broken as it is not optimised for the dask cluster.
         timer.reset()
         measurement_pairs_df = calculate_measurement_pair_metrics(sources_df)
         logger.info("Measurement pair metrics time: %.2f seconds", timer.reset())
@@ -243,11 +254,17 @@ def final_operations(
     # 1       94              12961
 
     related_df = (
-        srcs_df.loc[srcs_df["related_list"] != -1, ["related_list"]]
+        srcs_df.loc[
+            (srcs_df["related_list"].apply(len) > 0) & (srcs_df["related_list"].apply(lambda x: x[0] != "NULL")),
+            ["related_list"]]
         .explode("related_list")
         .reset_index()
         .rename(columns={"source": "from_source_id", "related_list": "to_source_id"})
     )
+
+    if related_df.empty:
+        # Add the 'from_source_id' column to the empty dataframe
+        related_df = pd.DataFrame(columns=["from_source_id", "to_source_id"])
 
     # drop relationships with the same source
     related_df = related_df.loc[
@@ -291,15 +308,20 @@ def final_operations(
 
     if add_mode:
         # Load old associations so the already uploaded ones can be removed
-        old_associations = pd.read_parquet(previous_parquets["associations"]).rename(
+        old_associations = dd.read_parquet(previous_parquets["associations"]).rename(
             columns={"meas_id": "id", "source_id": "source"}
         )
-        sources_df_upload = pd.concat(
+        sources_df_upload = dd.concat(
             [sources_df, old_associations],
             ignore_index=True
         )
-        sources_df_upload = sources_df_upload.drop_duplicates(
+        # Annoyingly keep=False doesn't work with dask, so we have to compute
+        # the drop_duplicates and then recompute the dask dataframe
+        sources_df_upload = sources_df_upload.compute().drop_duplicates(
             ["source", "id", "d2d", "dr"], keep=False
+        )
+        sources_df_upload = dd.from_pandas(
+            sources_df_upload, npartitions=sources_df.npartitions
         )
         logger.debug(f"Add mode: #{sources_df_upload.shape[0]} associations to upload.")
     else:

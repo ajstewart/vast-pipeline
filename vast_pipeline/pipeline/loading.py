@@ -70,6 +70,10 @@ def copy_upload_model(
             Defaults to 10_000.
     """
     total_rows = len(df)
+
+    if total_rows == 0:
+        return
+
     start_index = 0
 
     while start_index < total_rows:
@@ -255,7 +259,15 @@ def _prepare_sources_df_for_upload(
 
     sources_df["run_id"] = run_id
 
-    sources_df = sources_df.reset_index().rename(columns={"source": "id"})
+    sources_df = sources_df.reset_index()
+
+    # I have no idea why this seems to happen sometimes
+    # The groupby is sometimes returning a dataframe with the name of the index
+    # column as "index" and sometimes as "source". It should be 'source'.
+    if "index" in sources_df.columns:
+        sources_df = sources_df.rename(columns={"index": "id"})
+    else:
+        sources_df = sources_df.rename(columns={"source": "id"})
 
     return sources_df
 
@@ -405,14 +417,18 @@ def copy_upload_associations(associations_df: pd.DataFrame, batch_size: int = 10
         "dr": "dr"
     }
 
-    associations_df["db_id"] = [str(uuid4()) for _ in range(len(associations_df))]
+    to_upload = associations_df.compute()
+
+    to_upload["db_id"] = [str(uuid4()) for _ in range(len(to_upload))]
 
     copy_upload_model(
-        associations_df[columns_to_upload],
+        to_upload[columns_to_upload],
         Association,
         mapping=mapping,
         batch_size=batch_size
     )
+
+    del to_upload
 
 
 def make_upload_associations(associations_df: pd.DataFrame) -> None:
